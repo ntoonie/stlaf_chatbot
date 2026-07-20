@@ -25,7 +25,7 @@ export async function sendChatMessage(
     `${BACKEND_URL}/chat`,
     payload,
     {
-      timeout: 60000,
+      timeout: 120000,
       headers: {
         Authorization: `Bearer ${session.access_token}`,
       },

@@ -71,8 +71,8 @@ def chat(request: ChatRequest, user: dict = Depends(verify_jwt)):
         raise HTTPException(status_code=503, detail="Still starting up, try again shortly.")
 
     verified_user_id = user["sub"]
+    session = app_state["session_store"].get_or_create(request.session_id)
 
-    session = app_state["session_store"].get_or_create(verified_user_id)
     result = run_full_pipeline(
         request.question, session,
         app_state["collection"], app_state["embedding_model"],

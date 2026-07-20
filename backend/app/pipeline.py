@@ -13,6 +13,30 @@ import time
 import sys
 import os
 from pathlib import Path
+# OLLAMA PIPELINE
+import requests as http_requests  # separate name to avoid clashing with any existing 'requests' import
+
+OLLAMA_URL = "http://localhost:11434/api/generate"
+OLLAMA_MODEL = "llama3.2:3b"
+USE_OLLAMA = os.environ.get("USE_OLLAMA", "false").lower() == "true"
+
+if USE_OLLAMA:
+    print("🦙 USE_OLLAMA=true - generation will use local Ollama (llama3.2:3b), not Claude or mock mode.")
+
+
+def _generate_ollama_response(system_message: str, user_message: str) -> str:
+    """Real generation via a locally-running Ollama model - no API key,
+    no cost, fully offline. Slower than Claude, but genuinely real
+    output instead of mock placeholder text."""
+    full_prompt = f"{system_message}\n\n{user_message}"
+    response = http_requests.post(
+        OLLAMA_URL,
+        json={"model": OLLAMA_MODEL, "prompt": full_prompt, "stream": False},
+        timeout=120,
+    )
+    response.raise_for_status()
+    return response.json()["response"].strip()
+#END OF OLLAMA PIPELINE
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent / "scripts"))
 from rag_utils import (
@@ -148,8 +172,11 @@ ANSWER:"""
 
 
 def generate_response(system_message: str, user_message: str, max_new_tokens: int = 400) -> str:
-    """Calls the Claude API for generation, or returns mock placeholder
-    text if MOCK_MODE is active (no API key configured yet)."""
+    """Calls Ollama, Claude, or returns mock text - checked in that
+    priority order. USE_OLLAMA takes precedence even if a Claude key
+    is also present, so you can force free local testing on demand."""
+    if USE_OLLAMA:
+        return _generate_ollama_response(system_message, user_message)
     if MOCK_MODE:
         return _generate_mock_response(user_message)
 
@@ -179,11 +206,23 @@ def _generate_mock_response(user_message: str) -> str:
     )
 
 
+AMBIGUOUS_REFERENCE_WORDS = {"it", "that", "this", "them", "those", "these", "he", "she", "they"}
+
+
+def question_seems_self_contained(question: str) -> bool:
+    """Cheap heuristic: if the question doesn't start with a pronoun-like
+    reference word and is reasonably long, it's very likely already
+    self-contained - skip the unreliable-on-small-models rewriting step
+    entirely rather than risk contamination."""
+    first_word = question.strip().split()[0].lower() if question.strip() else ""
+    return first_word not in AMBIGUOUS_REFERENCE_WORDS and len(question.split()) >= 4
+
+
 def rewrite_query_with_history(question: str, session: ConversationSession) -> str:
-    """Resolves ambiguous follow-up questions into fully self-contained
-    questions BEFORE retrieval."""
     if not session.has_history():
         return question
+    if question_seems_self_contained(question):
+        return question  # skip rewriting entirely - avoid unnecessary contamination risk
 
     rewrite_system_message = (
         "You rewrite a user's latest question into a fully self-contained "

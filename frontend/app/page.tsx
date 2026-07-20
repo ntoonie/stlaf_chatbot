@@ -6,6 +6,7 @@ import { sendChatMessage } from "../lib/api";
 import { createClient } from "../lib/supabase";
 import type { ChatMessage } from "../lib/types";
 import type { User } from "@supabase/supabase-js";
+import { v4 as uuidv4 } from "uuid";
 
 const REFUSAL_TEXT =
   "I could not find information about this in the Philippine labor law documents I have access to.";
@@ -19,6 +20,14 @@ export default function Home() {
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const router = useRouter();
   const supabase = createClient();
+  const [conversationSessionId] = useState<string>(() => uuidv4());
+
+  useEffect(() => {
+  supabase.auth.getSession().then(({ data, error }) => {
+    console.log("SESSION DEBUG:", data.session);
+    console.log("SESSION ERROR:", error);
+  });
+}, []);
 
   // Check auth status on page load; redirect to /login if not signed in
   useEffect(() => {
@@ -54,7 +63,7 @@ export default function Home() {
     try {
       // Use the authenticated user's ID as the session identifier -
       // replaces the old random UUID from the pre-auth version
-      const result = await sendChatMessage(question, user.id);
+      const result = await sendChatMessage(question, conversationSessionId);
       setMessages((prev) => [
         ...prev,
         { role: "assistant", content: result.answer, citations: result.citations },
