@@ -25,13 +25,16 @@ from pipeline import (
     build_full_prompt,
     generate_response,
     is_refusal,
+    question_seems_non_english,
+    translate_question_to_english,
     SYSTEM_INSTRUCTIONS,
     MOCK_MODE,
     USE_OLLAMA,
+    ENABLE_TRANSLATION,
     OLLAMA_MODEL,
 )
 
-QUESTION = "Pwede po bang mag-resign nang walang 30-day notice?"
+QUESTION = "Can I resign without giving a 1 month notice?"
 
 EMBEDDING_MODEL_NAME = "BAAI/bge-m3"
 
@@ -78,13 +81,38 @@ def main() -> None:
         return
 
     # ============================================================
+    # STAGE 1.5: Translation - the NEW step, mirrors what
+    # run_full_pipeline actually does. Earlier versions of this
+    # script called build_full_prompt() directly and skipped this
+    # entirely, which meant it was silently testing the OLD pipeline
+    # even after pipeline.py was updated - fixed now.
+    # ============================================================
+    print("=" * 70)
+    print("STAGE 1.5: TRANSLATION")
+    print("=" * 70)
+    print(f"ENABLE_TRANSLATION: {ENABLE_TRANSLATION}")
+
+    is_non_english = question_seems_non_english(QUESTION)
+    print(f"question_seems_non_english(QUESTION): {is_non_english}")
+
+    english_gloss = None
+    if ENABLE_TRANSLATION and is_non_english:
+        print("Calling translate_question_to_english()...")
+        english_gloss = translate_question_to_english(QUESTION)
+        print(f"english_gloss: {english_gloss!r}")
+    else:
+        print("Translation SKIPPED (either disabled via ENABLE_TRANSLATION,")
+        print("or question_seems_non_english() returned False).")
+    print()
+
+    # ============================================================
     # STAGE 2: Prompt construction - see EXACTLY what gets sent
     # ============================================================
     print("=" * 70)
     print("STAGE 2: ASSEMBLED PROMPT (exactly what the LLM receives)")
     print("=" * 70)
 
-    full_prompt = build_full_prompt(QUESTION, retrieval_result)
+    full_prompt = build_full_prompt(QUESTION, retrieval_result, english_gloss)
     full_text_sent = f"{SYSTEM_INSTRUCTIONS}\n\n{full_prompt}"
 
     print(full_text_sent)

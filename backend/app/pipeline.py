@@ -62,6 +62,16 @@ if MOCK_MODE:
     print("⚠️  No ANTHROPIC_API_KEY found - running in MOCK MODE. "
           "Generation will return placeholder text, not real Claude output.")
 
+# Toggle for the Tagalog/Taglish English-gloss translation step (see
+# question_seems_non_english / translate_question_to_english below).
+# Built while llama3.2:3b was the only generator and needed the help;
+# untested whether Claude needs it too. Since each translation is a
+# SECOND full generation call, this doubles Claude API cost on every
+# Tagalog/Taglish question specifically - A/B test with this flag
+# before assuming it's still worth keeping on once a real Claude key
+# is in use.
+ENABLE_TRANSLATION = os.environ.get("ENABLE_TRANSLATION", "true").lower() == "true"
+
 
 def get_claude_client() -> Anthropic:
     global _client
@@ -81,6 +91,8 @@ STRICT RULES YOU MUST FOLLOW:
 3. When you DO answer, you MUST cite the specific source document and page number for every claim, using the format: (Source: [document title], p.[page number]).
 4. Do not guess, estimate, or infer information that is not explicitly stated in the RETRIEVED CONTEXT.
 5. Keep answers clear and direct, written for a non-lawyer to understand, while remaining accurate to the legal text.
+6. The RETRIEVED CONTEXT is written in English even when the QUESTION is in Tagalog or Taglish - this is expected, not a sign the context doesn't apply. If an English translation of the question is provided below the QUESTION, use it only to confirm your understanding of what is being asked. Your ANSWER must still be written in the same language as the original QUESTION, not the translation.
+7. Never include the refusal sentence anywhere in your response unless it is the ENTIRE response. If you are able to answer using the RETRIEVED CONTEXT, do not append, reference, restate, or hedge with the refusal sentence afterward - a correct answer must stand on its own, with nothing contradicting it at the end.
 """
 
 
@@ -142,13 +154,13 @@ def retrieve_relevant_chunks(
     scores are HIGHER = better (not lower = better, like distance was),
     and live on a completely different numeric scale - roughly
     0.008-0.033 for typical rank positions with the default rrf_k=50,
-    NOT the ~0.3-0.9 range distance used. min_score_threshold=0.001 here
-    is an EXPLICIT PLACEHOLDER that accepts everything - it has NOT
-    been calibrated against real output yet. Run test_retrieval.py,
-    look at real rrf_score values, and set this properly - same
-    iterative process as every previous threshold in this project
-    (MiniLM->BGE-M3, ChromaDB->pgvector). Do not treat 0.0 as a real
-    production value."""
+    NOT the ~0.3-0.9 range distance used. min_score_threshold=0.01 is a
+    genuine floor derived from real hybrid_search_law_chunks output
+    (observed range ~0.0185-0.0392 for relevant results), not a guess -
+    it's set low deliberately since RRF score can't reliably separate
+    right from wrong on its own (see the failed 'Article 300' full-
+    sentence test) - that job belongs to the reranker, not this
+    threshold."""
     query_embedding = embedding_model.encode([question], normalize_embeddings=True).tolist()[0]
 
     client = get_supabase_admin_client()
@@ -175,13 +187,21 @@ def retrieve_relevant_chunks(
     return {"found": True, "chunks": passing_chunks, "best_score": best_score}
 
 
-def build_full_prompt(question: str, retrieval_result: dict) -> str:
-    """Assembles the user-turn content: labeled retrieved context + question."""
+def build_full_prompt(question: str, retrieval_result: dict, english_gloss: str | None = None) -> str:
+    """Assembles the user-turn content: labeled retrieved context +
+    question, plus an optional English gloss of the question (for
+    Tagalog/Taglish input) to help generation, without replacing the
+    original question the answer must still be written in."""
     context_text = format_retrieved_context(retrieval_result.get("chunks", []))
+    gloss_block = (
+        f"\n(English translation of the question, for your understanding only: {english_gloss})"
+        if english_gloss
+        else ""
+    )
     return f"""RETRIEVED CONTEXT:
 {context_text}
 
-QUESTION: {question}
+QUESTION: {question}{gloss_block}
 
 ANSWER:"""
 
@@ -256,6 +276,56 @@ REWRITTEN SELF-CONTAINED QUESTION:"""
     return rewritten.strip()
 
 
+# Common Filipino function words unlikely to appear in genuine English
+# text - a cheap, no-LLM-call gate so English-only questions skip
+# translation entirely, rather than paying for an extra generation
+# call on every single request. Not exhaustive, not a real language
+# detector - just needs to catch the common case cheaply.
+TAGALOG_MARKER_WORDS = {
+    "ang", "ng", "mga", "na", "sa", "ba", "po", "opo", "hindi", "oo",
+    "ako", "ikaw", "siya", "kami", "tayo", "kayo", "sila", "ito", "iyan",
+    "paano", "saan", "kailan", "bakit", "sino", "ilan", "walang", "may",
+    "meron", "nang", "lang", "din", "rin", "naman", "kasi", "yung",
+}
+
+
+def question_seems_non_english(question: str) -> bool:
+    """Cheap heuristic: if any common Tagalog function word appears,
+    the question is very likely Tagalog or Taglish. Deliberately loose
+    (matches on Taglish too, not just pure Tagalog) - the cost of a
+    false positive here is one extra translation call; the cost of a
+    false negative is the exact generation-refusal failure mode this
+    whole feature exists to fix."""
+    words = set(re.findall(r"[a-zA-Z]+", question.lower()))
+    return bool(words & TAGALOG_MARKER_WORDS)
+
+
+def translate_question_to_english(question: str) -> str:
+    """Get an English gloss of a Tagalog/Taglish question, to help
+    generation - NOT used for retrieval, since BGE-M3 already handles
+    Tagalog/Taglish retrieval well natively (confirmed via
+    test_retrieval.py). This targets the generation-stage failure
+    debug_single_query.py isolated: correct context retrieved, but the
+    model still refused, most likely from struggling to map a Tagalog
+    question onto English legal text unassisted.
+
+    Falls back to the original question if translation comes back
+    empty - never let a translation failure silently break the whole
+    pipeline."""
+    translate_system_message = (
+        "You are a translator. Translate the user's question into "
+        "clear, natural English. Output ONLY the English translation, "
+        "with no explanation, prefix, quotes, or commentary."
+    )
+    translate_user_message = f"QUESTION: {question}\n\nENGLISH TRANSLATION:"
+
+    translated = generate_response(
+        translate_system_message, translate_user_message, max_new_tokens=100
+    )
+    translated = translated.strip()
+    return translated if translated else question
+
+
 def build_structured_citations(retrieval_result: dict, snippet_length: int = 150) -> list[dict]:
     """Builds citations from ACTUAL retrieval results, never by parsing
     the LLM's own generated text."""
@@ -305,7 +375,17 @@ def run_full_pipeline(
             "latency_seconds": time.perf_counter() - start_time,
         }
 
-    full_prompt = build_full_prompt(resolved_question, retrieval_result)
+    # Retrieval already succeeded using the ORIGINAL (possibly Tagalog)
+    # question - BGE-M3 handles Tagalog/Taglish retrieval well natively,
+    # so translation is deliberately NOT used here. It's only applied
+    # now, for generation, targeting the specific failure
+    # debug_single_query.py isolated: correct context retrieved, model
+    # still refused.
+    english_gloss = None
+    if ENABLE_TRANSLATION and question_seems_non_english(resolved_question):
+        english_gloss = translate_question_to_english(resolved_question)
+
+    full_prompt = build_full_prompt(resolved_question, retrieval_result, english_gloss)
     raw_answer = generate_response(SYSTEM_INSTRUCTIONS, full_prompt, max_new_tokens=600)
 
     llm_refused = is_refusal(raw_answer)
