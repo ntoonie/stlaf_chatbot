@@ -56,11 +56,57 @@ def fix_hyphenated_linebreaks(text: str) -> str:
     return re.sub(r"(\w+)-\n(\w+)", r"\1\2", text)
 
 
+def fix_split_article_numbers(text: str) -> str:
+    """pypdf occasionally inserts a stray space inside a multi-digit
+    Article/Section number during extraction (e.g. 'ART. 13 1.'
+    instead of 'ART. 131.') - a kerning artifact. This breaks
+    LEGAL_HEADING_PATTERN's \\d+ match, so the Article is never
+    detected as a heading and silently gets absorbed into the tail
+    of the PRECEDING chunk instead of starting its own. Confirmed via
+    grep: 12 instances, all in labor_code_of_the_philippines.pdf."""
+    return re.sub(
+        r"((?:ART(?:ICLE)?|SEC(?:TION)?)\.?\s*)(\d+)\s+(\d+)\b",
+        r"\1\2\3",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+
+def fix_footnote_artifacts(text: str) -> str:
+    """pypdf flattens superscript footnote reference numbers onto the
+    same baseline as surrounding body text, right after an Article/
+    Section title's ending period (e.g. 'Benefits .105 - (a)' or
+    'Board. 19 - (a)' instead of 'Benefits. - (a)' / 'Board. - (a)').
+    Confirmed via grep: 31 instances, all in
+    labor_code_of_the_philippines.pdf, split across two sub-patterns
+    depending on whether the extractor displaced the title's own
+    period or left it in place."""
+    # Case 1 (27 instances): the title's period got displaced AFTER
+    # the footnote digits, with a spurious space inserted before it -
+    # e.g. 'Benefits .105 - (' -> 'Benefits. - ('
+    text = re.sub(
+        r"\s+\.(\d{1,4})(\s*[-\u2013\u2014]\s*\()",
+        r".\2",
+        text,
+    )
+    # Case 2 (4 instances): the title's period is already correctly
+    # placed, and a bare footnote digit follows it directly -
+    # e.g. 'Board. 19 - (' -> 'Board. - ('
+    text = re.sub(
+        r"(?<=[.\u2019\u201d\"])\s+\d{1,4}(\s*[-\u2013\u2014]\s*\()",
+        r"\1",
+        text,
+    )
+    return text
+
+
 def build_full_text_with_page_map(pages: list[dict]) -> tuple[str, list[tuple[int, int, int]]]:
     parts, page_map = [], []
     cursor = 0
     for page in pages:
         cleaned = fix_hyphenated_linebreaks(page["text"])
+        cleaned = fix_split_article_numbers(cleaned)
+        cleaned = fix_footnote_artifacts(cleaned)
         start = cursor
         parts.append(cleaned)
         cursor += len(cleaned)

@@ -46,6 +46,8 @@ from rag_utils import (
     REFUSAL_MESSAGE,
 )
 
+from supabase_client import get_supabase_admin_client
+
 from anthropic import Anthropic
 
 # ============================================================
@@ -126,38 +128,51 @@ class SessionStore:
 
 def retrieve_relevant_chunks(
     question: str,
-    collection,
     embedding_model,
     top_k: int = 4,
-    distance_threshold: float = 0.85,
+    min_score_threshold: float = 0.01,
 ) -> dict:
-    """Embed the question, query ChromaDB, and filter by distance
-    threshold. Returns found=False if nothing passes the bar - this is
-    the FIRST line of defense against hallucination."""
-    query_embedding = embedding_model.encode([question], normalize_embeddings=True).tolist()
-    results = collection.query(query_embeddings=query_embedding, n_results=top_k)
+    """Embed the question, run HYBRID search (BM25-equivalent full-text
+    search + dense vector search, combined via Reciprocal Rank Fusion)
+    through the hybrid_search_law_chunks RPC function, and filter by
+    score threshold. Returns found=False if nothing passes the bar -
+    this is the FIRST line of defense against hallucination.
 
-    if not results["ids"][0]:
-        return {"found": False, "chunks": [], "best_distance": None}
+    IMPORTANT DIRECTION FLIP from the old distance-based version: RRF
+    scores are HIGHER = better (not lower = better, like distance was),
+    and live on a completely different numeric scale - roughly
+    0.008-0.033 for typical rank positions with the default rrf_k=50,
+    NOT the ~0.3-0.9 range distance used. min_score_threshold=0.001 here
+    is an EXPLICIT PLACEHOLDER that accepts everything - it has NOT
+    been calibrated against real output yet. Run test_retrieval.py,
+    look at real rrf_score values, and set this properly - same
+    iterative process as every previous threshold in this project
+    (MiniLM->BGE-M3, ChromaDB->pgvector). Do not treat 0.0 as a real
+    production value."""
+    query_embedding = embedding_model.encode([question], normalize_embeddings=True).tolist()[0]
 
-    distances = results["distances"][0]
-    best_distance = min(distances)
+    client = get_supabase_admin_client()
+    response = client.rpc(
+        "hybrid_search_law_chunks",
+        {
+            "query_text": question,
+            "query_embedding": query_embedding,
+            "match_count": top_k,
+        },
+    ).execute()
 
-    if best_distance > distance_threshold:
-        return {"found": False, "chunks": [], "best_distance": best_distance}
+    rows = response.data
+    if not rows:
+        return {"found": False, "chunks": [], "best_score": None}
 
-    passing_chunks = []
-    for i in range(len(results["ids"][0])):
-        if distances[i] <= distance_threshold:
-            passing_chunks.append(
-                {
-                    "chunk_id": results["ids"][0][i],
-                    "text": results["documents"][0][i],
-                    "distance": distances[i],
-                    **results["metadatas"][0][i],
-                }
-            )
-    return {"found": True, "chunks": passing_chunks, "best_distance": best_distance}
+    scores = [row["rrf_score"] for row in rows]
+    best_score = max(scores)
+
+    if best_score < min_score_threshold:
+        return {"found": False, "chunks": [], "best_score": best_score}
+
+    passing_chunks = [row for row in rows if row["rrf_score"] >= min_score_threshold]
+    return {"found": True, "chunks": passing_chunks, "best_score": best_score}
 
 
 def build_full_prompt(question: str, retrieval_result: dict) -> str:
@@ -257,7 +272,7 @@ def build_structured_citations(retrieval_result: dict, snippet_length: int = 150
                 "page_reference": page_ref,
                 "category": chunk["category"],
                 "snippet": snippet,
-                "distance": chunk["distance"],
+                "relevance_score": chunk["rrf_score"],
             }
         )
     return citations
@@ -266,10 +281,9 @@ def build_structured_citations(retrieval_result: dict, snippet_length: int = 150
 def run_full_pipeline(
     question: str,
     session: ConversationSession,
-    collection,
     embedding_model,
     top_k: int = 4,
-    distance_threshold: float = 0.85,
+    min_score_threshold: float = 0.01,
 ) -> dict:
     """The complete pipeline: memory -> retrieval -> prompting ->
     generation -> citations."""
@@ -278,7 +292,7 @@ def run_full_pipeline(
     resolved_question = rewrite_query_with_history(question, session)
 
     retrieval_result = retrieve_relevant_chunks(
-        resolved_question, collection, embedding_model, top_k, distance_threshold
+        resolved_question, embedding_model, top_k, min_score_threshold
     )
 
     if not retrieval_result["found"]:

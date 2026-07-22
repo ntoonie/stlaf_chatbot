@@ -15,32 +15,30 @@ from fastapi.middleware.cors import CORSMiddleware
 from schemas import ChatRequest, ChatResponse
 from pipeline import run_full_pipeline, SessionStore
 from auth import verify_jwt
-from supabase_client import get_or_create_chat_session, persist_message, persist_usage_log
+from supabase_client import (
+    get_or_create_chat_session,
+    persist_message,
+    persist_usage_log,
+    get_supabase_admin_client,
+)
 
-import chromadb
 from sentence_transformers import SentenceTransformer
 
-PROJECT_ROOT = BASE_DIR.parent.parent
-CHROMA_DB_DIR = str(PROJECT_ROOT / "chroma_db")
-COLLECTION_NAME = "ph_labor_law"
-EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+# ChromaDB / chroma_db directory retired - retrieval now goes through
+# pgvector in Supabase (law_chunks table + match_law_chunks RPC),
+# reached fresh per-request inside pipeline.py rather than held here.
+EMBEDDING_MODEL_NAME = "BAAI/bge-m3"
 
 app_state: dict = {}
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("Loading ChromaDB collection...")
-    client = chromadb.PersistentClient(path=CHROMA_DB_DIR)
-    # get_or_create_collection so the app can start even with ZERO
-    # documents indexed yet - correct for the current empty-corpus stage.
-    app_state["collection"] = client.get_or_create_collection(name=COLLECTION_NAME)
-
     print("Loading embedding model...")
     app_state["embedding_model"] = SentenceTransformer(EMBEDDING_MODEL_NAME)
 
     app_state["session_store"] = SessionStore()
-    print(f"Startup complete. Collection has {app_state['collection'].count()} indexed chunks.")
+    print("Startup complete. Embedding model loaded, ready to serve requests.")
 
     yield
     app_state.clear()
@@ -58,16 +56,25 @@ app.add_middleware(
 
 @app.get("/health")
 def health_check():
+    ready = "embedding_model" in app_state
+    indexed_chunks = 0
+    if ready:
+        try:
+            client = get_supabase_admin_client()
+            result = client.table("law_chunks").select("chunk_id", count="exact").execute()
+            indexed_chunks = result.count
+        except Exception as e:
+            print(f"WARNING: health check could not reach Supabase: {e}")
     return {
         "status": "ok",
-        "ready": "collection" in app_state,
-        "indexed_chunks": app_state["collection"].count() if "collection" in app_state else 0,
+        "ready": ready,
+        "indexed_chunks": indexed_chunks,
     }
 
 
 @app.post("/chat", response_model=ChatResponse)
 def chat(request: ChatRequest, user: dict = Depends(verify_jwt)):
-    if "collection" not in app_state:
+    if "embedding_model" not in app_state:
         raise HTTPException(status_code=503, detail="Still starting up, try again shortly.")
 
     verified_user_id = user["sub"]
@@ -75,7 +82,7 @@ def chat(request: ChatRequest, user: dict = Depends(verify_jwt)):
 
     result = run_full_pipeline(
         request.question, session,
-        app_state["collection"], app_state["embedding_model"],
+        app_state["embedding_model"],
     )
 
     try:

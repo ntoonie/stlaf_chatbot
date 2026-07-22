@@ -14,7 +14,7 @@ DATA_PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
 CHUNKS_PATH = DATA_PROCESSED_DIR / "chunks.json"
 EMBEDDINGS_PATH = DATA_PROCESSED_DIR / "embeddings.npy"
 
-EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+EMBEDDING_MODEL_NAME = "BAAI/bge-m3"
 
 
 def main() -> None:

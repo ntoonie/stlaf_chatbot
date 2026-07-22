@@ -21,7 +21,7 @@ class SourceCitation(BaseModel):
     page_reference: str
     category: str
     snippet: str
-    distance: float
+    relevance_score: float
 
 
 class ChatResponse(BaseModel):
