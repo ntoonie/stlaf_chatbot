@@ -22,12 +22,13 @@ from supabase_client import (
     get_supabase_admin_client,
 )
 
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer, CrossEncoder
 
 # ChromaDB / chroma_db directory retired - retrieval now goes through
 # pgvector in Supabase (law_chunks table + match_law_chunks RPC),
 # reached fresh per-request inside pipeline.py rather than held here.
 EMBEDDING_MODEL_NAME = "BAAI/bge-m3"
+RERANKER_MODEL_NAME = "BAAI/bge-reranker-v2-m3"
 
 app_state: dict = {}
 
@@ -37,8 +38,11 @@ async def lifespan(app: FastAPI):
     print("Loading embedding model...")
     app_state["embedding_model"] = SentenceTransformer(EMBEDDING_MODEL_NAME)
 
+    print("Loading reranker model...")
+    app_state["reranker_model"] = CrossEncoder(RERANKER_MODEL_NAME)
+
     app_state["session_store"] = SessionStore()
-    print("Startup complete. Embedding model loaded, ready to serve requests.")
+    print("Startup complete. Embedding + reranker models loaded, ready to serve requests.")
 
     yield
     app_state.clear()
@@ -56,7 +60,7 @@ app.add_middleware(
 
 @app.get("/health")
 def health_check():
-    ready = "embedding_model" in app_state
+    ready = "embedding_model" in app_state and "reranker_model" in app_state
     indexed_chunks = 0
     if ready:
         try:
@@ -74,7 +78,7 @@ def health_check():
 
 @app.post("/chat", response_model=ChatResponse)
 def chat(request: ChatRequest, user: dict = Depends(verify_jwt)):
-    if "embedding_model" not in app_state:
+    if "embedding_model" not in app_state or "reranker_model" not in app_state:
         raise HTTPException(status_code=503, detail="Still starting up, try again shortly.")
 
     verified_user_id = user["sub"]
@@ -82,7 +86,7 @@ def chat(request: ChatRequest, user: dict = Depends(verify_jwt)):
 
     result = run_full_pipeline(
         request.question, session,
-        app_state["embedding_model"],
+        app_state["embedding_model"], app_state["reranker_model"],
     )
 
     try:

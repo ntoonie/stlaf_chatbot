@@ -40,7 +40,7 @@ export default function ResetPasswordPage() {
   return (
     <div className="auth-container">
       <h1>Set New Password</h1>
-      <p className="auth-subtitle">Philippine Labor Law Chatbot</p>
+      <br></br>
 
       {error && <div className="auth-error">{error}</div>}
 

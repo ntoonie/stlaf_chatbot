@@ -47,6 +47,19 @@ def is_refusal(answer_text: str) -> bool:
     return answer_text.strip() == REFUSAL_MESSAGE
 
 
+def contains_refusal(answer_text: str) -> bool:
+    """Check whether the refusal sentence appears ANYWHERE in the text,
+    not just as an exact full match. Confirmed necessary in production:
+    llama3.2:3b sometimes blends the refusal sentence with extra
+    commentary (e.g. a trailing meta-note about its own rule-compliance)
+    despite SYSTEM_INSTRUCTIONS explicitly forbidding this - prompt
+    instructions are advisory, not guaranteed, especially on small
+    models. This is the deterministic code-level backstop: if the
+    refusal sentence is present at all, treat the whole answer as
+    untrustworthy, regardless of what else surrounds it."""
+    return REFUSAL_MESSAGE in answer_text
+
+
 def passes_distance_threshold(distances: list[float], threshold: float) -> bool:
     """Given a list of distances, check whether the BEST (lowest) one
     passes the confidence threshold."""

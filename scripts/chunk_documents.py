@@ -21,6 +21,39 @@ LEGAL_HEADING_PATTERN = re.compile(
     re.MULTILINE | re.IGNORECASE,
 )
 
+# Matches lines like '(v) Labor Code - Presidential Decree No. 442, as
+# amended' - a short capitalized term immediately followed by a dash.
+# Deliberately distinct from ordinary lettered statutory subsections
+# like '(a) Every employer shall grant...', which start with a full
+# sentence, not a short term-then-dash. Verified against real examples
+# from this corpus before use - see chunk_looks_like_glossary().
+GLOSSARY_LINE_PATTERN = re.compile(
+    r"^\([a-z]\)\s+[A-Z][A-Za-z0-9/.,]*(?:\s[A-Za-z0-9/.,]+){0,5}\s*[-\u2013\u2014]\s",
+    re.MULTILINE,
+)
+
+GLOSSARY_MIN_MATCHING_LINES = 3
+
+
+def chunk_looks_like_glossary(text: str) -> bool:
+    """Detects alphabetized 'Definition of Terms' style chunks (e.g.
+    RA 10022.pdf_0127: a run of '(t) IC - Insurance Commission',
+    '(v) Labor Code - Presidential Decree No. 442, as amended', etc.).
+
+    Found because a chunk exactly like this scored 0.70 with the
+    cross-encoder reranker on 'What is the Labor Code?' - HIGHER than
+    the actual substantive Article 173 definition - despite containing
+    no real legal content, just a one-line name mapping. A glossary
+    entry restating a query's own words back at it looks like a
+    near-perfect surface match to a reranker, while being useless as
+    generation context.
+
+    min_matching_lines=3 deliberately excludes short, legitimate
+    'Definition of Terms' sections that only define 1-2 terms - those
+    ARE useful substantive content and should stay in the corpus."""
+    matches = GLOSSARY_LINE_PATTERN.findall(text)
+    return len(matches) >= GLOSSARY_MIN_MATCHING_LINES
+
 
 @dataclass
 class Chunk:
@@ -165,8 +198,22 @@ def process_document_into_chunks(pages_json_path: Path) -> list[Chunk]:
     structural_pieces = split_by_legal_structure(full_text)
     final_pieces = enforce_max_chunk_size(structural_pieces, MAX_CHUNK_CHARS, CHUNK_OVERLAP_CHARS)
 
+    # Drop glossary/definitions-list pieces BEFORE assigning chunk_id
+    # indices, so IDs stay sequential over only the surviving pieces
+    # rather than leaving numbering gaps.
+    kept_pieces = []
+    skipped_count = 0
+    for offset, text in final_pieces:
+        if chunk_looks_like_glossary(text):
+            skipped_count += 1
+            continue
+        kept_pieces.append((offset, text))
+
+    if skipped_count:
+        print(f"    -> skipped {skipped_count} glossary-pattern chunk(s)")
+
     chunks = []
-    for i, (offset, text) in enumerate(final_pieces):
+    for i, (offset, text) in enumerate(kept_pieces):
         start_page = find_page_for_offset(offset, page_map)
         end_page = find_page_for_offset(min(offset + len(text), len(full_text) - 1), page_map)
         chunks.append(Chunk(

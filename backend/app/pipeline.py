@@ -43,6 +43,7 @@ from rag_utils import (
     format_page_reference,
     format_retrieved_context,
     is_refusal,
+    contains_refusal,
     REFUSAL_MESSAGE,
 )
 
@@ -141,26 +142,40 @@ class SessionStore:
 def retrieve_relevant_chunks(
     question: str,
     embedding_model,
+    reranker_model,
     top_k: int = 4,
+    candidate_pool_size: int = 20,
     min_score_threshold: float = 0.01,
+    min_rerank_score: float = 0.05,
 ) -> dict:
-    """Embed the question, run HYBRID search (BM25-equivalent full-text
-    search + dense vector search, combined via Reciprocal Rank Fusion)
-    through the hybrid_search_law_chunks RPC function, and filter by
-    score threshold. Returns found=False if nothing passes the bar -
-    this is the FIRST line of defense against hallucination.
+    """Embed the question, run HYBRID search (BM25 + dense + RRF) to
+    fetch a CANDIDATE POOL (larger than top_k), then RERANK that pool
+    with a cross-encoder before taking the final top_k. Returns
+    found=False if nothing passes either bar.
 
-    IMPORTANT DIRECTION FLIP from the old distance-based version: RRF
-    scores are HIGHER = better (not lower = better, like distance was),
-    and live on a completely different numeric scale - roughly
-    0.008-0.033 for typical rank positions with the default rrf_k=50,
-    NOT the ~0.3-0.9 range distance used. min_score_threshold=0.01 is a
-    genuine floor derived from real hybrid_search_law_chunks output
-    (observed range ~0.0185-0.0392 for relevant results), not a guess -
-    it's set low deliberately since RRF score can't reliably separate
-    right from wrong on its own (see the failed 'Article 300' full-
-    sentence test) - that job belongs to the reranker, not this
-    threshold."""
+    Two-stage filtering:
+    1. min_score_threshold (RRF, unchanged from before) - a loose
+       floor confirming SOMETHING relevant came back at all.
+    2. min_rerank_score (NEW) - the real confidence gate. RRF score
+       couldn't reliably separate right from wrong on its own (see the
+       failed 'Article 300' full-sentence test); a cross-encoder
+       reranker scores the query and EACH candidate chunk TOGETHER,
+       rather than comparing independently-computed embeddings -
+       structurally better suited to catching cases like the
+       paternity/maternity leave confusion (debug_paternity_maternity.py)
+       that dense+BM25 both missed.
+
+    min_rerank_score=0.05 is a real, calibrated floor - derived from
+    observing real rerank_score output across many test queries
+    (test_retrieval.py): confirmed-relevant results consistently score
+    well above this (0.3-0.95 typically), while genuinely weak/
+    incorrect result pools stayed well below it (e.g. the failing
+    Taglish resignation query, whose best score was 0.017). NOTE: this
+    threshold can only catch LOW-CONFIDENCE wrong answers - it cannot
+    catch a CONFIDENTLY wrong one (see the 'Labor Code' glossary-chunk
+    case in debug_reranker_regression.py, which scored 0.44 despite
+    being incorrect) - that's a distinct, documented, unresolved
+    limitation, not something a score threshold can ever fix."""
     query_embedding = embedding_model.encode([question], normalize_embeddings=True).tolist()[0]
 
     client = get_supabase_admin_client()
@@ -169,22 +184,33 @@ def retrieve_relevant_chunks(
         {
             "query_text": question,
             "query_embedding": query_embedding,
-            "match_count": top_k,
+            "match_count": candidate_pool_size,
         },
     ).execute()
 
-    rows = response.data
-    if not rows:
+    candidates = response.data
+    if not candidates:
         return {"found": False, "chunks": [], "best_score": None}
 
-    scores = [row["rrf_score"] for row in rows]
-    best_score = max(scores)
+    best_rrf_score = max(row["rrf_score"] for row in candidates)
+    if best_rrf_score < min_score_threshold:
+        return {"found": False, "chunks": [], "best_score": best_rrf_score}
 
-    if best_score < min_score_threshold:
-        return {"found": False, "chunks": [], "best_score": best_score}
+    # Cross-encoder reranking: score EVERY (question, chunk_text) pair
+    # jointly, not independently like embeddings do.
+    pairs = [(question, row["text"]) for row in candidates]
+    rerank_scores = reranker_model.predict(pairs)
+    for row, score in zip(candidates, rerank_scores):
+        row["rerank_score"] = float(score)
 
-    passing_chunks = [row for row in rows if row["rrf_score"] >= min_score_threshold]
-    return {"found": True, "chunks": passing_chunks, "best_score": best_score}
+    reranked = sorted(candidates, key=lambda r: r["rerank_score"], reverse=True)
+    best_rerank_score = reranked[0]["rerank_score"]
+
+    if best_rerank_score < min_rerank_score:
+        return {"found": False, "chunks": [], "best_score": best_rerank_score}
+
+    top_chunks = [r for r in reranked if r["rerank_score"] >= min_rerank_score][:top_k]
+    return {"found": True, "chunks": top_chunks, "best_score": best_rerank_score}
 
 
 def build_full_prompt(question: str, retrieval_result: dict, english_gloss: str | None = None) -> str:
@@ -245,12 +271,25 @@ AMBIGUOUS_REFERENCE_WORDS = {"it", "that", "this", "them", "those", "these", "he
 
 
 def question_seems_self_contained(question: str) -> bool:
-    """Cheap heuristic: if the question doesn't start with a pronoun-like
-    reference word and is reasonably long, it's very likely already
-    self-contained - skip the unreliable-on-small-models rewriting step
-    entirely rather than risk contamination."""
-    first_word = question.strip().split()[0].lower() if question.strip() else ""
-    return first_word not in AMBIGUOUS_REFERENCE_WORDS and len(question.split()) >= 4
+    """Cheap heuristic: if the question contains no pronoun-like
+    reference word ANYWHERE and is reasonably long, it's very likely
+    already self-contained - skip the unreliable-on-small-models
+    rewriting step entirely rather than risk contamination.
+
+    FIXED (previously checked only the FIRST word, e.g.
+    question.split()[0]) - confirmed via test_query_rewrite.py that
+    this missed mid-sentence pronouns: 'Is it different for
+    probationary employees?' was wrongly classified as self-contained
+    since 'it' isn't the first word, so the ambiguous 'it' sailed
+    straight into retrieval unresolved. Now checks every word.
+
+    Known remaining gap, NOT fixed by this change: questions that are
+    context-dependent WITHOUT using a pronoun at all (e.g. 'How about
+    for paternity leave?', following a maternity leave question) still
+    pass as self-contained - this heuristic can only catch pronoun-
+    based ambiguity, not implicit topical continuation."""
+    words = {w.lower().strip(".,?!") for w in question.split()}
+    return not (words & AMBIGUOUS_REFERENCE_WORDS) and len(question.split()) >= 4
 
 
 def rewrite_query_with_history(question: str, session: ConversationSession) -> str:
@@ -342,7 +381,7 @@ def build_structured_citations(retrieval_result: dict, snippet_length: int = 150
                 "page_reference": page_ref,
                 "category": chunk["category"],
                 "snippet": snippet,
-                "relevance_score": chunk["rrf_score"],
+                "relevance_score": chunk["rerank_score"],
             }
         )
     return citations
@@ -352,17 +391,21 @@ def run_full_pipeline(
     question: str,
     session: ConversationSession,
     embedding_model,
+    reranker_model,
     top_k: int = 4,
+    candidate_pool_size: int = 20,
     min_score_threshold: float = 0.01,
+    min_rerank_score: float = 0.05,
 ) -> dict:
-    """The complete pipeline: memory -> retrieval -> prompting ->
-    generation -> citations."""
+    """The complete pipeline: memory -> retrieval (hybrid search +
+    rerank) -> prompting -> generation -> citations."""
     start_time = time.perf_counter()
 
     resolved_question = rewrite_query_with_history(question, session)
 
     retrieval_result = retrieve_relevant_chunks(
-        resolved_question, embedding_model, top_k, min_score_threshold
+        resolved_question, embedding_model, reranker_model,
+        top_k, candidate_pool_size, min_score_threshold, min_rerank_score,
     )
 
     if not retrieval_result["found"]:
@@ -388,13 +431,20 @@ def run_full_pipeline(
     full_prompt = build_full_prompt(resolved_question, retrieval_result, english_gloss)
     raw_answer = generate_response(SYSTEM_INSTRUCTIONS, full_prompt, max_new_tokens=600)
 
-    llm_refused = is_refusal(raw_answer)
+    # contains_refusal() (not just is_refusal()'s exact match) catches
+    # cases like llama3.2:3b blending the refusal sentence with extra
+    # meta-commentary despite SYSTEM_INSTRUCTIONS rule 7 forbidding
+    # this - confirmed happening in production. When detected, show
+    # the user a clean, single, trustworthy refusal instead of the
+    # model's messy hedge-text with contradictory citations attached.
+    llm_refused = contains_refusal(raw_answer)
+    final_answer = REFUSAL_MESSAGE if llm_refused else raw_answer
     citations = build_structured_citations(retrieval_result) if not llm_refused else []
 
-    session.add_turn(question, raw_answer)
+    session.add_turn(question, final_answer)
 
     return {
-        "answer": raw_answer,
+        "answer": final_answer,
         "citations": citations,
         "citation_count": len(citations),
         "found_context": True,

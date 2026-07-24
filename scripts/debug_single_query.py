@@ -19,12 +19,13 @@ load_dotenv()
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "backend" / "app"))
 
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer, CrossEncoder
 from pipeline import (
     retrieve_relevant_chunks,
     build_full_prompt,
     generate_response,
     is_refusal,
+    contains_refusal,
     question_seems_non_english,
     translate_question_to_english,
     SYSTEM_INSTRUCTIONS,
@@ -34,9 +35,10 @@ from pipeline import (
     OLLAMA_MODEL,
 )
 
-QUESTION = "Can I resign without giving a 1 month notice?"
+QUESTION = "Pwede po bang mag-resign nang walang 30-day notice?"
 
 EMBEDDING_MODEL_NAME = "BAAI/bge-m3"
+RERANKER_MODEL_NAME = "BAAI/bge-reranker-v2-m3"
 
 
 def main() -> None:
@@ -50,6 +52,9 @@ def main() -> None:
 
     print(f"Loading embedding model: {EMBEDDING_MODEL_NAME} ...")
     embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+
+    print(f"Loading reranker model: {RERANKER_MODEL_NAME} ...")
+    reranker_model = CrossEncoder(RERANKER_MODEL_NAME)
     print()
 
     # ============================================================
@@ -60,17 +65,17 @@ def main() -> None:
     print("=" * 70)
     print(f"QUESTION: {QUESTION}\n")
 
-    retrieval_result = retrieve_relevant_chunks(QUESTION, embedding_model)
+    retrieval_result = retrieve_relevant_chunks(QUESTION, embedding_model, reranker_model)
 
     print(f"found: {retrieval_result['found']}")
-    print(f"best_score: {retrieval_result.get('best_score')}")
+    print(f"best_score: {retrieval_result.get('best_score')}  (this is now the RERANK score, not RRF)")
     print(f"number of chunks returned: {len(retrieval_result.get('chunks', []))}\n")
 
     for i, chunk in enumerate(retrieval_result.get("chunks", [])):
         print(f"--- Chunk {i + 1} ---")
         print(f"  title: {chunk['title']}")
         print(f"  page: {chunk.get('start_page')}-{chunk.get('end_page')}")
-        print(f"  rrf_score: {chunk.get('rrf_score')}")
+        print(f"  rerank_score: {chunk.get('rerank_score')}  (rrf_score was: {chunk.get('rrf_score')})")
         print(f"  FULL TEXT (unabridged):")
         print(f"  {chunk['text']}")
         print()
@@ -143,11 +148,14 @@ def main() -> None:
     print("RAW ANSWER (exactly what the model returned):")
     print(raw_answer)
     print()
-    print(f"is_refusal(raw_answer): {is_refusal(raw_answer)}")
-    print(f"(is_refusal requires an EXACT match to the refusal string - if")
-    print(f" the model blended a partial answer with refusal-like text,")
-    print(f" this would print False even though the answer is still bad -")
-    print(f" worth reading the raw answer above regardless of this result.)")
+    print(f"is_refusal(raw_answer):       {is_refusal(raw_answer)}   (exact match only)")
+    print(f"contains_refusal(raw_answer): {contains_refusal(raw_answer)}   (substring - this is what run_full_pipeline actually uses now)")
+    if contains_refusal(raw_answer) and not is_refusal(raw_answer):
+        print()
+        print("NOTE: the refusal sentence is present but NOT as an exact match -")
+        print("      this is the blended-refusal case. run_full_pipeline will now")
+        print("      show the user the CLEAN refusal message, not this raw text,")
+        print("      and will NOT attach citations.")
 
 
 if __name__ == "__main__":

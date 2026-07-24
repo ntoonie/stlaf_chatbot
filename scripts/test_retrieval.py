@@ -1,13 +1,14 @@
 """
-test_retrieval.py - Manually inspect HYBRID retrieval quality (BM25
-full-text + dense vector, fused via RRF) against pgvector/Supabase,
-without needing the FastAPI server, auth, or a real Claude call.
-Prints RAW rrf_score (no threshold filtering) so you can pick a real
-min_score_threshold for pipeline.py based on actual output.
+test_retrieval.py - Fetches a candidate pool via hybrid search (BM25 +
+dense + RRF), then reranks it with a cross-encoder, printing BOTH
+orderings side by side so you can see exactly what reranking changed -
+not just trust that it helped.
 
-IMPORTANT: rrf_score is HIGHER = better, opposite direction from the
-old distance-based version, and on a completely different numeric
-scale (roughly 0.008-0.033 for typical rank positions, not ~0.3-0.9).
+REPLACES the pre-reranker version. Prints raw rerank_score (no
+threshold filtering) so you can calibrate min_rerank_score in
+pipeline.py from real output - I could not verify bge-reranker-v2-m3's
+score range myself (blocked network in my build environment), so this
+number is genuinely unconfirmed until you look at real values here.
 
 Run: python scripts/test_retrieval.py
 """
@@ -21,43 +22,47 @@ load_dotenv()
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "backend" / "app"))
 
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer, CrossEncoder
 from supabase_client import get_supabase_admin_client
 
 EMBEDDING_MODEL_NAME = "BAAI/bge-m3"
-TOP_K = 4
+RERANKER_MODEL_NAME = "BAAI/bge-reranker-v2-m3"
+CANDIDATE_POOL_SIZE = 20
+FINAL_TOP_K = 4
 
 TEST_QUERIES = [
     # --- Known-good baseline ---
     "What are the requirements for maternity leave?",
     "How is 13th month pay computed?",
 
-    # --- Known-bad baseline (the "broad question" bug) - the main
-    # thing hybrid search is supposed to help with, since BM25 can
-    # match the literal phrase "Labor Code" where dense search alone
-    # struggled ---
+    # --- Known-bad baseline (the "broad question" bug) ---
     "What is the Labor Code?",
 
-    # --- Exact-identifier query - dense search historically smooths
-    # over exact numbers; BM25 should be strong here specifically ---
+    # --- Exact-identifier query ---
     "What does Article 300 say?",
 
     # --- Taglish / code-switching ---
     "Ano ang requirements para sa maternity leave?",
     "Pwede po bang mag-resign nang walang 30-day notice?",
 
-    # --- Pure Tagalog - expect BM25 to contribute little/nothing here
-    # since content_tsv is 'english'-config over an English corpus;
-    # semantic_search should still carry these, same as before ---
-    "Ano ang mga kondisyon para sa pagbibigay ng maternity leave?",
+    # --- Pure Tagalog ---
     "Ilang araw ang maternity leave sa Pilipinas?",
-    "Paano kinakalkula ang ikalabintatlong buwang sahod?",
+
+    # --- THE case that motivated building the reranker at all -
+    # dense+BM25 both put Expanded Maternity Leave Law above the
+    # correct Paternity Leave Act here (see
+    # debug_paternity_maternity.py). This is the one query in this
+    # list where reranking actually needs to prove itself.
+    "Ilang araw ang paternity leave na pwedeng makuha ng ama?",
 ]
 
 
 def main() -> None:
     print(f"Loading embedding model: {EMBEDDING_MODEL_NAME} ...")
-    model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+    embed_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+
+    print(f"Loading reranker model: {RERANKER_MODEL_NAME} ...")
+    reranker = CrossEncoder(RERANKER_MODEL_NAME)
 
     print("Connecting to Supabase...")
     client = get_supabase_admin_client()
@@ -70,44 +75,52 @@ def main() -> None:
         print(f"QUERY: {query}")
         print("=" * 70)
 
-        query_embedding = model.encode([query], normalize_embeddings=True).tolist()[0]
-
+        query_embedding = embed_model.encode([query], normalize_embeddings=True).tolist()[0]
         response = client.rpc(
             "hybrid_search_law_chunks",
             {
                 "query_text": query,
                 "query_embedding": query_embedding,
-                "match_count": TOP_K,
+                "match_count": CANDIDATE_POOL_SIZE,
             },
         ).execute()
-        rows = response.data
+        candidates = response.data
 
-        if not rows:
-            print("  (no results returned at all)")
-            print()
+        if not candidates:
+            print("  (no results returned at all)\n")
             continue
 
-        for i, row in enumerate(rows):
-            text_preview = row["text"][:150].replace("\n", " ")
-            print(
-                f"  [{i + 1}] rrf_score={row['rrf_score']:.5f}  "
-                f"{row['title']} (p.{row['start_page']})"
-            )
+        print(f"--- BEFORE reranking (RRF order, top {FINAL_TOP_K} of {len(candidates)} candidates) ---")
+        for i, row in enumerate(candidates[:FINAL_TOP_K]):
+            print(f"  [{i + 1}] rrf_score={row['rrf_score']:.5f}  {row['title']} (p.{row['start_page']})")
+
+        pairs = [(query, row["text"]) for row in candidates]
+        rerank_scores = reranker.predict(pairs)
+        for row, score in zip(candidates, rerank_scores):
+            row["rerank_score"] = float(score)
+        reranked = sorted(candidates, key=lambda r: r["rerank_score"], reverse=True)
+
+        print(f"--- AFTER reranking (top {FINAL_TOP_K}) ---")
+        for i, row in enumerate(reranked[:FINAL_TOP_K]):
+            text_preview = row["text"][:100].replace("\n", " ")
+            print(f"  [{i + 1}] rerank_score={row['rerank_score']:.4f}  (rrf was {row['rrf_score']:.5f})  {row['title']} (p.{row['start_page']})")
             print(f"      \"{text_preview}...\"")
+
+        before_top = candidates[0]["chunk_id"]
+        after_top = reranked[0]["chunk_id"]
+        if before_top != after_top:
+            print(f"  >>> RERANKING CHANGED RANK 1 (was: {candidates[0]['title']} -> now: {reranked[0]['title']})")
         print()
 
     print("=" * 70)
-    print("Eyeball the rrf_score values above:")
-    print("  - HIGHER = better now (opposite of the old distance metric).")
-    print("  - Compare 'What is the Labor Code?' and 'Article 300' results")
-    print("    against your dense-only pgvector run - these are the two")
-    print("    queries hybrid search should visibly improve.")
-    print("  - For the pure Tagalog queries, check whether rankings")
-    print("    changed much from dense-only - expected to be similar,")
-    print("    since content_tsv can't lexically match Tagalog text.")
-    print("  - Pick min_score_threshold in pipeline.py: somewhere between")
-    print("    your worst still-relevant score and your best clearly-")
-    print("    irrelevant score, same process as every previous threshold.")
+    print("Eyeball the rerank_score values above:")
+    print("  - HIGHER = better (same convention as RRF, unlike raw distance).")
+    print("  - For the paternity/maternity query specifically: did reranking")
+    print("    fix it? Compare AFTER's rank 1 against BEFORE's.")
+    print("  - Find the gap between your worst genuinely-relevant score and")
+    print("    your best clearly-irrelevant score - that's min_rerank_score.")
+    print("  - This number is COMPLETELY UNCONFIRMED until you do this -")
+    print("    it was never tested against a live model before now.")
 
 
 if __name__ == "__main__":

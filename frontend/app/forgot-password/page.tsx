@@ -1,8 +1,11 @@
-// frontend/app/forgot-password/page.tsx
+// RECONSTRUCTED from project_knowledge_search - verify against your
+// real app/forgot-password/page.tsx before replacing it.
+
 "use client";
 
 import { useState } from "react";
 import { createClient } from "../../lib/supabase";
+import MarketingShell from "../components/marketing-shell";
 
 export default function ForgotPasswordPage() {
   const [email, setEmail] = useState("");
@@ -31,26 +34,28 @@ export default function ForgotPasswordPage() {
   };
 
   return (
-    <div className="auth-container">
-      <h1>Reset Password</h1>
-      <p className="auth-subtitle">Philippine Labor Law Chatbot</p>
+    <MarketingShell>
+      <div className="auth-card">
+        <h1>Reset Password</h1>
+        <p className="auth-subtitle">Philippine Labor Law Chatbot</p>
 
-      {error && <div className="auth-error">{error}</div>}
-      {message && <div className="auth-success">{message}</div>}
+        {error && <div className="auth-error">{error}</div>}
+        {message && <div className="auth-success">{message}</div>}
 
-      <input
-        type="email"
-        placeholder="Email"
-        value={email}
-        onChange={(e) => setEmail(e.target.value)}
-      />
-      <button onClick={handleReset} disabled={loading || !email}>
-        {loading ? "Sending..." : "Send Reset Link"}
-      </button>
+        <input
+          type="email"
+          placeholder="Email"
+          value={email}
+          onChange={(e) => setEmail(e.target.value)}
+        />
+        <button onClick={handleReset} disabled={loading || !email}>
+          {loading ? "Sending..." : "Send Reset Link"}
+        </button>
 
-      <p className="auth-footer">
-        <a href="/login">Back to Sign In</a>
-      </p>
-    </div>
+        <p className="auth-footer">
+          <a href="/login">Back to Sign In</a>
+        </p>
+      </div>
+    </MarketingShell>
   );
 }

@@ -1,10 +1,21 @@
 """
-build_vector_db.py - Upserts chunks + embeddings + metadata into the
-Supabase pgvector table `law_chunks`. Idempotent - safe to re-run.
+build_vector_db.py - Rebuilds the Supabase pgvector table `law_chunks`
+from chunks.json + embeddings.npy. Clears the table first, then
+inserts fresh - NOT purely upsert-based anymore.
 
 REPLACES the ChromaDB version. Same input files (chunks.json,
 embeddings.npy), same batching approach - only the destination
 changed, from a local ChromaDB collection to Supabase/pgvector.
+
+WHY CLEAR FIRST, NOT JUST UPSERT: chunks.json is the single source of
+truth for what SHOULD be in the table. If chunk_documents.py ever
+REMOVES a chunk that existed in a previous run (e.g. the glossary-
+detection filter added to skip 'Definition of Terms' list-style
+chunks), a pure upsert would never delete that now-stale row - it
+would sit orphaned in Supabase forever, since upsert only adds/
+updates, never removes. Clearing first guarantees the table always
+exactly matches chunks.json, with no possibility of leftover rows
+from an earlier chunking scheme.
 
 Prerequisite: run 001_create_law_chunks_pgvector.sql in the Supabase
 SQL Editor once, before running this script.
@@ -48,6 +59,15 @@ def main() -> None:
 
     client = get_supabase_admin_client()
 
+    existing_count = (
+        client.table(TABLE_NAME).select("chunk_id", count="exact").execute().count
+    )
+    print(f"\nClearing existing table ({existing_count} rows currently)...")
+    # PostgREST requires a filter on delete - neq on an impossible
+    # value is the standard idiom for "delete every row".
+    client.table(TABLE_NAME).delete().neq("chunk_id", "__never_matches__").execute()
+    print("Table cleared.")
+
     total = len(chunks)
     for start in range(0, total, BATCH_SIZE):
         end = min(start + BATCH_SIZE, total)
@@ -74,18 +94,16 @@ def main() -> None:
                 }
             )
 
-        # upsert on chunk_id (the primary key) - matches the
-        # idempotent "safe to re-run" behavior of the original
-        # ChromaDB script.
-        client.table(TABLE_NAME).upsert(rows, on_conflict="chunk_id").execute()
-        print(f"  Upserted chunks {start}-{end - 1} of {total}")
+        client.table(TABLE_NAME).insert(rows).execute()
+        print(f"  Inserted chunks {start}-{end - 1} of {total}")
 
     count_result = (
         client.table(TABLE_NAME)
         .select("chunk_id", count="exact")
         .execute()
     )
-    print(f"\nTable '{TABLE_NAME}' now contains {count_result.count} items.")
+    print(f"\nTable '{TABLE_NAME}' now contains {count_result.count} items "
+          f"(was {existing_count} before this run).")
 
 
 if __name__ == "__main__":
